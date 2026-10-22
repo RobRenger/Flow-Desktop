@@ -16,6 +16,7 @@ import {
   Maximize2,
   Loader2,
   X,
+  Cast,
 } from "lucide-react";
 
 import { useMusicPlayerStore } from "../../store/useMusicPlayerStore";
@@ -30,6 +31,8 @@ import { MusicArtwork } from "./MusicArtwork";
 import { MusicScrubber } from "./MusicScrubber";
 import { EqPanel } from "./EqPanel";
 import { VolumePopover } from "./VolumePopover";
+import { CastPopover } from "./CastPopover";
+import { useCastStore } from "../../store/useCastStore";
 import { useDominantColor } from "../../lib/useDominantColor";
 import { accentForeground, accentSurface } from "../../lib/accentColor";
 import { upgradeMusicImageUrl } from "../../lib/thumbnails";
@@ -60,7 +63,8 @@ export function GlobalMusicDock() {
 
   const { errorInfo, onRetry, onCopyLogs, onOpenInBrowser } = useMusicPlayerError();
 
-  const [popover, setPopover] = useState<null | "eq" | "vol">(null);
+  const [popover, setPopover] = useState<null | "eq" | "vol" | "cast">(null);
+  const casting = useCastStore((s) => s.phase === "connected" || s.phase === "connecting");
   const menu = useMusicContextMenu(Boolean(currentTrack));
   const menuActions = useNowPlayingMenuActions(currentTrack);
 
@@ -240,6 +244,16 @@ export function GlobalMusicDock() {
               </HapticButton>
 
               <HapticButton
+                onClick={() => setPopover((p) => (p === "cast" ? null : "cast"))}
+                aria-label={getString("music_cast")}
+                aria-pressed={popover === "cast"}
+                className={popover === "cast" || casting ? GHOST : GHOST_IDLE}
+                style={popover === "cast" || casting ? accentActive : undefined}
+              >
+                <Cast className="h-[18px] w-[18px]" />
+              </HapticButton>
+
+              <HapticButton
                 onClick={() => openOverlay("full")}
                 aria-label={getString("music_expand")}
                 className={GHOST_IDLE}
@@ -262,6 +276,9 @@ export function GlobalMusicDock() {
           </div>
           <div className="absolute bottom-full right-2 mb-3">
             <VolumePopover open={popover === "vol"} />
+          </div>
+          <div className="absolute bottom-full right-2 mb-3">
+            <CastPopover open={popover === "cast"} onClose={() => setPopover(null)} />
           </div>
         </motion.div>
       )}

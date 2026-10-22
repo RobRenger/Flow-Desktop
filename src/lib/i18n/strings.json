@@ -1292,5 +1292,14 @@
   "settings_blocked_pin_desc": "Ask for a PIN before a blocked video can be revealed. This is a lock against accident, not encryption — anyone with access to this computer's files can still read the block list.",
   "settings_blocked_pin_set": "Set PIN",
   "settings_blocked_pin_clear": "Clear PIN",
-  "settings_blocked_pin_placeholder": "New PIN"
+  "settings_blocked_pin_placeholder": "New PIN",
+  "music_cast": "Play on a speaker",
+  "music_cast_searching": "Looking for speakers and speaker groups…",
+  "music_cast_none": "No Google Cast speakers found. Make sure this computer is on the same network.",
+  "music_cast_group": "Speaker group",
+  "music_cast_connecting": "Connecting to %s…",
+  "music_cast_playing_on": "Playing on %s",
+  "music_cast_failed": "Could not play on %s. Music is back on this computer.",
+  "music_cast_stop": "Stop casting",
+  "music_cast_refresh": "Search again"
 }

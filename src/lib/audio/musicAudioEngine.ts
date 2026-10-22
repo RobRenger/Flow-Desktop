@@ -40,7 +40,22 @@ function unload(el: HTMLAudioElement): void {
   }
 }
 
+
+/** A speaker that plays the music instead of this window's audio elements. */
+export interface RemoteOutput {
+  load(url: string, mimeType: string | null): Promise<void>;
+  play(): void;
+  pause(): void;
+  seek(seconds: number): void;
+  setVolume(volume: number): void;
+  getCurrentTime(): number;
+  getDuration(): number;
+  stop(): void;
+}
+
 class MusicAudioEngine {
+  private remote: RemoteOutput | null = null;
+
   private slots: [Slot, Slot] = [emptySlot(), emptySlot()];
   private activeIndex: 0 | 1 = 0;
   private ctx: AudioContext | null = null;
@@ -138,7 +153,18 @@ class MusicAudioEngine {
 
   // --- transport ----------------------------------------------------------
 
-  async load(url: string): Promise<void> {
+  /** Route playback to a speaker, or back to this window with `null`. */
+  setRemote(remote: RemoteOutput | null): void {
+    this.remote = remote;
+    if (remote) for (const slot of this.slots) slot.el?.pause();
+  }
+
+  isRemote(): boolean {
+    return this.remote !== null;
+  }
+
+  async load(url: string, mimeType: string | null = null): Promise<void> {
+    if (this.remote) return this.remote.load(url, mimeType);
     const el = this.active.el;
     if (!el) return;
     this.active.key = null;
@@ -155,6 +181,7 @@ class MusicAudioEngine {
    * that track.
    */
   preload(key: string, url: string, loudnessDb: number | null): void {
+    if (this.remote) return;
     const slot = this.standby;
     if (!slot.el || slot.key === key) return;
     slot.key = key;
@@ -169,6 +196,7 @@ class MusicAudioEngine {
 
   /** Whether the standby element holds `key` (buffered or still buffering). */
   hasPreloaded(key: string): boolean {
+    if (this.remote) return false;
     return this.standby.key === key && !!this.standby.el?.getAttribute("src");
   }
 
@@ -192,6 +220,7 @@ class MusicAudioEngine {
    * then plays it; the element that was playing is emptied.
    */
   activatePreloaded(key: string): boolean {
+    if (this.remote) return false;
     if (!this.preloadIsPlayable(key)) return false;
     const previous = this.active;
     this.activeIndex = this.activeIndex === 0 ? 1 : 0;
@@ -224,6 +253,10 @@ class MusicAudioEngine {
    * element still fetching metadata is ignored by WebKit.
    */
   seekWhenReady(seconds: number): void {
+    if (this.remote) {
+      if (Number.isFinite(seconds) && seconds > 0) this.remote.seek(seconds);
+      return;
+    }
     const el = this.active.el;
     if (!el || !Number.isFinite(seconds) || seconds <= 0) return;
     if (el.readyState >= HTMLMediaElement.HAVE_METADATA) {
@@ -236,6 +269,7 @@ class MusicAudioEngine {
   }
 
   async play(): Promise<void> {
+    if (this.remote) return this.remote.play();
     const el = this.active.el;
     if (!el) return;
     this.ensureGraph();
@@ -258,10 +292,12 @@ class MusicAudioEngine {
   }
 
   pause(): void {
+    if (this.remote) return this.remote.pause();
     this.active.el?.pause();
   }
 
   stop(): void {
+    this.remote?.stop();
     for (const slot of this.slots) {
       slot.key = null;
       slot.loudnessDb = null;
@@ -270,6 +306,7 @@ class MusicAudioEngine {
   }
 
   seek(seconds: number): void {
+    if (this.remote) return this.remote.seek(Math.max(0, seconds));
     const el = this.active.el;
     if (el && Number.isFinite(seconds)) {
       el.currentTime = Math.max(0, seconds);
@@ -277,17 +314,21 @@ class MusicAudioEngine {
   }
 
   getCurrentTime(): number {
+    if (this.remote) return this.remote.getCurrentTime();
     return this.active.el?.currentTime ?? 0;
   }
 
   /** Seconds buffered ahead on the playing element, for stall detection. */
   getBufferedEnd(): number {
+    // A speaker buffers on its own; report plenty so stall detection stays quiet.
+    if (this.remote) return this.remote.getCurrentTime() + 60;
     const el = this.active.el;
     if (!el || el.buffered.length === 0) return 0;
     return el.buffered.end(el.buffered.length - 1);
   }
 
   getDuration(): number {
+    if (this.remote) return this.remote.getDuration();
     const d = this.active.el?.duration ?? 0;
     return Number.isFinite(d) ? d : 0;
   }
@@ -296,11 +337,13 @@ class MusicAudioEngine {
 
   setVolume(volume: number): void {
     this.volume = Math.max(0, Math.min(1, volume));
+    this.remote?.setVolume(this.muted ? 0 : this.volume);
     this.applyGain();
   }
 
   setMuted(muted: boolean): void {
     this.muted = muted;
+    this.remote?.setVolume(muted ? 0 : this.volume);
     this.applyGain();
   }
 

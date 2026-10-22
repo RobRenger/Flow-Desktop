@@ -3,6 +3,7 @@
 #![allow(clippy::missing_errors_doc)]
 
 pub mod api;
+mod cast;
 mod appimage;
 mod bridge;
 #[cfg(target_os = "linux")]
@@ -357,6 +358,7 @@ pub fn run() {
             app.manage(DownloadManager::default());
             app.manage(PlayerFullscreenState::default());
             app.manage(PipState::default());
+            app.manage(cast::CastState::default());
             app.manage(DiscordPresence::new());
 
             // Initialize and manage streaming proxy
@@ -427,6 +429,11 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            cast::cast_discover,
+            cast::cast_connect,
+            cast::cast_disconnect,
+            cast::cast_load,
+            cast::cast_control,
             search_videos,
             get_video_details,
             get_related_videos,

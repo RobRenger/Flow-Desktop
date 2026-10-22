@@ -81,6 +81,7 @@ zeroize = { version = "1", features = ["derive"] }
 tokio-tungstenite = "0.30"
 flate2 = "1"
 local-ip-address = "0.6"
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "aws_lc_rs"] }
 
 # Native Windows toast notifications: build the toast XML directly so we can attach
 # the app logo + a video thumbnail (hero image) and register a proper AppUserModelID,

@@ -458,7 +458,7 @@ export const useMusicPlayerStore = create<MusicPlayerState>((set, get) => ({
 
       set({ loudnessDb: info.loudnessDb, loadingStreamId: null });
       musicAudioEngine.setLoudness(info.loudnessDb, get().normalizationEnabled);
-      await musicAudioEngine.load(info.audioUrl);
+      await musicAudioEngine.load(info.audioUrl, info.mimeType);
       musicAudioEngine.seekWhenReady(resumeAt);
       await musicAudioEngine.play();
       afterStart();

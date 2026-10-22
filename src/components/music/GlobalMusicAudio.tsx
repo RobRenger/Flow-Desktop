@@ -21,6 +21,7 @@ const HISTORY_PERSIST_MS = 5000;
 const fromActive =
   (handler: (el: HTMLAudioElement) => void) =>
   (event: SyntheticEvent<HTMLAudioElement>) => {
+    if (musicAudioEngine.isRemote()) return;
     if (event.currentTarget === musicAudioEngine.getActiveElement()) handler(event.currentTarget);
   };
 
