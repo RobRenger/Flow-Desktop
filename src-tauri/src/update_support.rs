@@ -12,12 +12,18 @@ use tauri::utils::config::BundleType;
 /// manager owns updates.
 const DISTRO_MANAGED_MARKER: &str = "distro-managed";
 
+/// Personal fork build (RobRenger/Flow-Desktop). The upstream updater would
+/// replace it with the official release, which has no casting, so a fork
+/// build never registers the updater.
+const FORK_BUILD: bool = true;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum UpdateBlock {
     Flatpak,
     PackageManager,
     Unbundled,
+    Fork,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -39,11 +45,13 @@ impl UpdateSupport {
     }
 }
 
-fn decide(flatpak: bool, marker: bool, bundle: Option<&BundleType>) -> UpdateSupport {
+fn decide(flatpak: bool, marker: bool, fork: bool, bundle: Option<&BundleType>) -> UpdateSupport {
     let reason = if flatpak {
         Some(UpdateBlock::Flatpak)
     } else if marker {
         Some(UpdateBlock::PackageManager)
+    } else if fork {
+        Some(UpdateBlock::Fork)
     } else if bundle.is_none() {
         Some(UpdateBlock::Unbundled)
     } else {
@@ -64,6 +72,7 @@ pub fn detect(resource_dir: Option<&Path>) -> UpdateSupport {
     decide(
         flatpak,
         has_marker(resource_dir),
+        FORK_BUILD,
         tauri::utils::platform::bundle_type().as_ref(),
     )
 }
@@ -82,28 +91,37 @@ mod tests {
             BundleType::Msi,
             BundleType::App,
         ] {
-            assert!(decide(false, false, Some(&bundle)).supported, "{bundle:?}");
+            assert!(decide(false, false, false, Some(&bundle)).supported, "{bundle:?}");
         }
     }
 
     #[test]
     fn flatpak_wins_over_everything() {
-        let support = decide(true, true, Some(&BundleType::Deb));
+        let support = decide(true, true, true, Some(&BundleType::Deb));
         assert_eq!(support.reason, Some(UpdateBlock::Flatpak));
         assert!(!support.supported);
     }
 
     #[test]
     fn marker_blocks_a_repackaged_deb() {
-        let support = decide(false, true, Some(&BundleType::Deb));
+        let support = decide(false, true, false, Some(&BundleType::Deb));
         assert_eq!(support.reason, Some(UpdateBlock::PackageManager));
     }
 
     #[test]
     fn a_raw_binary_is_unbundled() {
-        let support = decide(false, false, None);
+        let support = decide(false, false, false, None);
         assert_eq!(support.reason, Some(UpdateBlock::Unbundled));
         assert!(!support.package_owns_desktop_entry());
+    }
+
+    #[test]
+    fn a_fork_build_never_updates_itself() {
+        let support = decide(false, false, true, Some(&BundleType::App));
+        assert_eq!(support.reason, Some(UpdateBlock::Fork));
+        assert!(!support.supported);
+        assert!(!support.package_owns_desktop_entry());
+        assert!(!detect(None).supported);
     }
 
     #[test]
@@ -121,9 +139,11 @@ mod tests {
 
     #[test]
     fn serializes_for_the_frontend() {
-        let json = serde_json::to_string(&decide(false, true, Some(&BundleType::Deb))).unwrap();
+        let json = serde_json::to_string(&decide(false, true, false, Some(&BundleType::Deb))).unwrap();
         assert_eq!(json, r#"{"supported":false,"reason":"package-manager"}"#);
-        let json = serde_json::to_string(&decide(false, false, Some(&BundleType::Deb))).unwrap();
+        let json = serde_json::to_string(&decide(false, false, false, Some(&BundleType::Deb))).unwrap();
         assert_eq!(json, r#"{"supported":true,"reason":null}"#);
+        let json = serde_json::to_string(&decide(false, false, true, Some(&BundleType::App))).unwrap();
+        assert_eq!(json, r#"{"supported":false,"reason":"fork"}"#);
     }
 }

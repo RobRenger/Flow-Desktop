@@ -879,6 +879,7 @@
   "settings_updates_managed_flatpak": "Updates are managed by Flatpak",
   "settings_updates_managed_package_manager": "Updates are managed by your package manager",
   "settings_updates_unbundled": "This build can't update itself",
+  "settings_updates_fork": "Personal fork build. It does not update itself, new versions come from RobRenger/Flow-Desktop",
   "music_play": "Play",
   "music_more_options": "More options",
   "music_like_track": "Like track",

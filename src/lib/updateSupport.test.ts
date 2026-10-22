@@ -29,5 +29,6 @@ describe("updateBlockedStringKey", () => {
     expect(updateBlockedStringKey("flatpak")).toBe("settings_updates_managed_flatpak");
     expect(updateBlockedStringKey("package-manager")).toBe("settings_updates_managed_package_manager");
     expect(updateBlockedStringKey("unbundled")).toBe("settings_updates_unbundled");
+    expect(updateBlockedStringKey("fork")).toBe("settings_updates_fork");
   });
 });
