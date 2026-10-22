@@ -195,6 +195,31 @@ export function GlobalVideoPlayer() {
     dismissVideoPlayer,
   ]);
 
+  // The docked frame is fixed above the page, outside its scroll container, so a wheel over the
+  // video would scroll nothing. Hand it to the container that holds the slot, like YouTube does.
+  // A scrollable panel inside the player (the settings menu) keeps its own wheel.
+  useEffect(() => {
+    const frame = frameRef.current;
+    if (!frame || isFloating || isVideoFullscreen) return;
+    const canScroll = (el: Element) => {
+      const { overflowY } = getComputedStyle(el);
+      return (overflowY === "auto" || overflowY === "scroll") && el.scrollHeight > el.clientHeight;
+    };
+    const onWheel = (event: WheelEvent) => {
+      for (let el = event.target as Element | null; el && el !== frame; el = el.parentElement) {
+        if (canScroll(el)) return;
+      }
+      const slot = document.querySelector<HTMLElement>("[data-flow-watch-player-slot='true']");
+      let scroller = slot?.parentElement ?? null;
+      while (scroller && !canScroll(scroller)) scroller = scroller.parentElement;
+      if (!scroller) return;
+      event.preventDefault();
+      scroller.scrollBy({ left: event.deltaX, top: event.deltaY });
+    };
+    frame.addEventListener("wheel", onWheel, { passive: false });
+    return () => frame.removeEventListener("wheel", onWheel);
+  }, [isFloating, isVideoFullscreen, currentVideo]);
+
   const expandFromFloating = useCallback(() => {
     if (!currentVideo) return;
     expandVideoPlayer();
