@@ -293,112 +293,228 @@ pub struct HistoryVideo {
     pub channel_name: String,
     pub channel_id: String,
     pub duration_seconds: Option<u64>,
+    pub watched_at_ms: u64,
 }
 
-const HISTORY_BOOTSTRAP_MAX: usize = 500;
-const HISTORY_BOOTSTRAP_PER_CHANNEL: usize = 20;
+fn history_text(video: &HistoryVideo) -> VideoText<'_> {
+    VideoText {
+        title: &video.title,
+        channel_name: &video.channel_name,
+        description: None,
+        duration_seconds: video.duration_seconds,
+        is_live: false,
+        is_short: false,
+    }
+}
 
-/// Teach the brain from watch history it never saw being watched (a sync or a Takeout import),
-/// the way Android's `FlowNeuroEngine.bootstrapFromWatchHistory` does: the newest
-/// [`HISTORY_BOOTSTRAP_MAX`] videos, at most [`HISTORY_BOOTSTRAP_PER_CHANNEL`] per channel, at a
-/// low rate that fades with age, so one binge or one channel can't take over the profile.
-/// `videos` is newest first. Videos the brain already counted are skipped, so running it again
-/// only learns what is new. Returns how many videos it learned from.
+/// A year-old watch counts half as much as one from today.
+const HISTORY_HALF_LIFE_DAYS: f64 = 365.0;
+/// Topics kept from the whole-history profile.
+const HISTORY_PROFILE_TOPICS: usize = 60;
+/// Steps the brain takes toward the whole-history profile, and how far each one goes.
+const HISTORY_PROFILE_STEPS: usize = 20;
+const HISTORY_PROFILE_RATE: f64 = 0.10;
+/// The newest videos that also feed topic evidence (which keeps 500 entries anyway).
+const HISTORY_EVIDENCE_VIDEOS: usize = 500;
+
+/// Teach the brain from watch history it never saw being watched (a sync or a Takeout import).
+///
+/// Feeding thousands of videos through the live update one by one would leave only the last few
+/// hundred: every update decays the topics the current video lacks. So all of `videos` is first
+/// folded into one profile, every video counted, newer ones weighted more (half-life one year) and
+/// each further video of the same channel weighted less (1/sqrt(n)), so one channel can't take
+/// over. The brain then takes a few steps toward that profile. Channel scores and topic pairs grow
+/// with how often they occur. Shorts and songs are left out. Returns how many videos it learned
+/// from.
 pub fn bootstrap_from_watch_history(brain: &mut UserBrain, videos: &[HistoryVideo]) -> usize {
-    let mature = brain.total_interactions > 50 && brain.global_vector.topics.len() > 10;
-    let history_rate = if mature { 0.015 } else { 0.035 };
+    let mut seen = HashSet::new();
+    let videos: Vec<&HistoryVideo> = videos
+        .iter()
+        .filter(|v| !v.video_id.is_empty() && !v.title.is_empty())
+        // Takeout doesn't mark Shorts or songs: a #shorts title and an auto-made "Artist - Topic"
+        // channel are the tells, and both belong to other profiles.
+        .filter(|v| {
+            let title = v.title.to_lowercase();
+            !["#short", "#fyp", "#viral"].iter().any(|tag| title.contains(tag))
+                && !v.channel_name.ends_with(" - Topic")
+        })
+        .filter(|v| seen.insert(v.video_id.as_str()))
+        .collect();
+    if videos.is_empty() {
+        return 0;
+    }
+    let spec = brain.key_spec();
+
+    // Document frequency first, over every video, so the profile below already knows which
+    // words are everywhere ("love", "time", a hashtag) and doesn't mistake them for interests.
+    {
+        let idf_snapshot = IdfSnapshot {
+            word_frequencies: brain.idf_word_frequency.clone(),
+            total_documents: brain.idf_total_documents,
+        };
+        for video in &videos {
+            if !brain.counted_documents.insert(video.video_id.clone()) {
+                continue;
+            }
+            let vector = extract_features(&history_text(video), &TopicReader { spec: spec.clone(), idf: &idf_snapshot });
+            for term in document_terms(&video.title, &vector, &spec) {
+                *brain.idf_word_frequency.entry(term).or_insert(0) += 1;
+            }
+            brain.idf_total_documents += 1;
+            if brain.idf_total_documents > 10000 {
+                for v in brain.idf_word_frequency.values_mut() {
+                    *v /= 2;
+                }
+                brain.idf_word_frequency.retain(|_, &mut v| v > 0);
+                brain.idf_total_documents /= 2;
+            }
+        }
+        if brain.idf_word_frequency.len() > IDF_MAX_KEYS {
+            let mut entries: Vec<(String, i32)> = brain.idf_word_frequency.drain().collect();
+            entries.sort_by(|a, b| b.1.cmp(&a.1));
+            entries.truncate(IDF_KEEP_KEYS);
+            brain.idf_word_frequency = entries.into_iter().collect();
+        }
+    }
+
     let idf_snapshot = IdfSnapshot {
         word_frequencies: brain.idf_word_frequency.clone(),
         total_documents: brain.idf_total_documents,
     };
-    let spec = brain.key_spec();
+    let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
 
-    let mut seen = HashSet::new();
-    let mut per_channel: HashMap<&str, usize> = HashMap::new();
-    let picked: Vec<&HistoryVideo> = videos
-        .iter()
-        .filter(|v| !v.video_id.is_empty() && !v.title.is_empty())
-        .filter(|v| !brain.counted_documents.contains(&v.video_id))
-        .filter(|v| seen.insert(v.video_id.as_str()))
-        .filter(|v| {
-            let key = if v.channel_id.is_empty() { v.channel_name.as_str() } else { v.channel_id.as_str() };
-            if key.is_empty() {
-                return true;
-            }
-            let count = per_channel.entry(key).or_insert(0);
-            *count += 1;
-            *count <= HISTORY_BOOTSTRAP_PER_CHANNEL
-        })
-        .take(HISTORY_BOOTSTRAP_MAX)
-        .collect();
+    let mut per_channel: HashMap<String, usize> = HashMap::new();
+    let mut topic_sum: HashMap<String, f64> = HashMap::new();
+    let (mut weight_sum, mut duration, mut pacing, mut complexity) = (0.0, 0.0, 0.0, 0.0);
+    let mut peak_sum = 0.0;
+    let mut pair_counts: HashMap<String, usize> = HashMap::new();
+    let mut vectors = Vec::with_capacity(videos.len());
 
-    for (index, video) in picked.iter().enumerate() {
-        let vector = extract_features(
-            &VideoText {
-                title: &video.title,
-                channel_name: &video.channel_name,
-                description: None,
-                duration_seconds: video.duration_seconds,
-                is_live: false,
-                is_short: false,
-            },
-            &TopicReader {
-                spec: spec.clone(),
-                idf: &idf_snapshot,
-            },
-        );
-        let decay = (1.0 - index as f64 / HISTORY_BOOTSTRAP_MAX as f64 * 0.4).clamp(0.6, 1.0);
-        brain.global_vector = adjust_vector(&brain.global_vector, &vector, history_rate * decay);
+    for video in &videos {
+        let vector = extract_features(&history_text(video), &TopicReader { spec: spec.clone(), idf: &idf_snapshot });
+        let channel = if video.channel_id.is_empty() { &video.channel_name } else { &video.channel_id };
+        let nth = per_channel.entry(channel.clone()).or_insert(0);
+        *nth += 1;
+        let age_days = now_ms.saturating_sub(video.watched_at_ms) as f64 / 86_400_000.0;
+        let weight = 0.5_f64.powf(age_days / HISTORY_HALF_LIFE_DAYS) / (*nth as f64).sqrt();
 
-        if !video.channel_id.is_empty() {
-            let current = *brain.channel_scores.get(&video.channel_id).unwrap_or(&0.5);
-            brain.channel_scores.insert(
-                video.channel_id.clone(),
-                current * CHANNEL_EMA_DECAY + CHANNEL_EMA_ALPHA,
-            );
+        for (topic, value) in &vector.topics {
+            *topic_sum.entry(topic.clone()).or_insert(0.0) += value * weight;
         }
+        peak_sum += vector.topics.values().cloned().fold(0.0, f64::max) * weight;
+        duration += vector.duration * weight;
+        pacing += vector.pacing * weight;
+        complexity += vector.complexity * weight;
+        weight_sum += weight;
 
         let mut top: Vec<(&String, &f64)> = vector.topics.iter().collect();
         top.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
         let top: Vec<&String> = top.into_iter().take(3).map(|(k, _)| k).collect();
         for i in 0..top.len() {
             for j in i + 1..top.len() {
-                let key = make_affinity_key(top[i], top[j]);
-                let current = *brain.topic_affinities.get(&key).unwrap_or(&0.0);
-                brain.topic_affinities.insert(key, (current + 0.01).min(AFFINITY_MAX));
+                *pair_counts.entry(make_affinity_key(top[i], top[j])).or_insert(0) += 1;
             }
         }
+        vectors.push(vector);
+    }
 
+    // 1. The whole-history profile, scaled so its strongest topic is as strong as a typical
+    //    video's strongest topic, then the brain steps toward it.
+    if weight_sum > 0.0 {
+        // A word in every other title says little about what someone likes, so each topic is
+        // weighted by how rare it is across the history (its inverse document frequency).
+        let documents = f64::from(brain.idf_total_documents.max(1));
+        let rarity = |topic: &str| {
+            let df = f64::from(*brain.idf_word_frequency.get(topic).unwrap_or(&0));
+            ((documents + 1.0) / (df + 1.0)).ln().max(0.0)
+        };
+        let mut topics: Vec<(String, f64)> = topic_sum
+            .into_iter()
+            .map(|(k, v)| {
+                let r = rarity(&k);
+                (k, v / weight_sum * r)
+            })
+            .collect();
+        topics.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        topics.truncate(HISTORY_PROFILE_TOPICS);
+        let top = topics.first().map(|(_, v)| *v).unwrap_or(0.0);
+        let scale = if top > 0.0 { (peak_sum / weight_sum) / top } else { 1.0 };
+        let profile = ContentVector {
+            topics: topics.into_iter().map(|(k, v)| (k, (v * scale).min(1.0))).collect(),
+            duration: duration / weight_sum,
+            pacing: pacing / weight_sum,
+            complexity: complexity / weight_sum,
+            ..ContentVector::default()
+        };
+        for _ in 0..HISTORY_PROFILE_STEPS {
+            brain.global_vector = adjust_vector(&brain.global_vector, &profile, HISTORY_PROFILE_RATE);
+        }
+    }
+
+    // 2. Channel scores: the same nudge toward 1 a watch gives, once per video (at most 30).
+    for (channel_id, count) in videos
+        .iter()
+        .filter(|v| !v.channel_id.is_empty())
+        .fold(HashMap::<&str, usize>::new(), |mut m, v| {
+            *m.entry(v.channel_id.as_str()).or_insert(0) += 1;
+            m
+        })
+    {
+        let mut score = *brain.channel_scores.get(channel_id).unwrap_or(&0.5);
+        for _ in 0..count.min(30) {
+            score = score * CHANNEL_EMA_DECAY + CHANNEL_EMA_ALPHA;
+        }
+        brain.channel_scores.insert(channel_id.to_string(), score);
+    }
+    if brain.channel_scores.len() > MAX_CHANNEL_SCORES {
+        let mut sorted: Vec<(String, f64)> = brain.channel_scores.drain().collect();
+        sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        sorted.truncate(MAX_CHANNEL_SCORES);
+        brain.channel_scores = sorted.into_iter().collect();
+    }
+
+    // 3. Topic pairs that keep showing up together.
+    for (key, count) in pair_counts {
+        let current = *brain.topic_affinities.get(&key).unwrap_or(&0.0);
+        brain
+            .topic_affinities
+            .insert(key, (current + 0.01 * (count as f64).sqrt()).min(AFFINITY_MAX));
+    }
+    brain.topic_affinities.retain(|_, &mut v| v > AFFINITY_PRUNE_THRESHOLD);
+    if brain.topic_affinities.len() > AFFINITY_MAX_ENTRIES {
+        let mut sorted: Vec<(String, f64)> = brain.topic_affinities.drain().collect();
+        sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        sorted.truncate(AFFINITY_KEEP_TOP);
+        brain.topic_affinities = sorted.into_iter().collect();
+    }
+
+    // 4. Topic evidence from the newest videos, oldest of those first.
+    let newest = videos.len().saturating_sub(HISTORY_EVIDENCE_VIDEOS);
+    for (video, vector) in videos.iter().zip(&vectors).skip(newest) {
         brain.topic_evidence = update_topic_evidence(
             &brain.topic_evidence,
-            &vector,
+            vector,
             &video.video_id,
             &video.channel_id,
             0.25,
             false,
             false,
         );
+    }
 
-        if brain.counted_documents.insert(video.video_id.clone()) {
-            for term in document_terms(&video.title, &vector, &spec) {
-                *brain.idf_word_frequency.entry(term).or_insert(0) += 1;
-            }
-            brain.idf_total_documents += 1;
-        }
+    // 5. The newest watches count as seen, so the feed doesn't offer them again.
+    let newest = videos.len().saturating_sub(WATCH_HISTORY_MAX);
+    for video in videos.iter().skip(newest) {
         brain.watch_history_map.entry(video.video_id.clone()).or_insert(0.5);
     }
+    while brain.watch_history_map.len() > WATCH_HISTORY_MAX {
+        let Some(key) = brain.watch_history_map.keys().next().cloned() else { break };
+        brain.watch_history_map.remove(&key);
+    }
 
-    if brain.idf_word_frequency.len() > IDF_MAX_KEYS {
-        let mut entries: Vec<(String, i32)> = brain.idf_word_frequency.drain().collect();
-        entries.sort_by(|a, b| b.1.cmp(&a.1));
-        entries.truncate(IDF_KEEP_KEYS);
-        brain.idf_word_frequency = entries.into_iter().collect();
-    }
-    if !picked.is_empty() {
-        brain.total_interactions += (picked.len() as i32).min(ONBOARDING_WARMUP_INTERACTIONS);
-        brain.has_completed_onboarding = true;
-    }
-    picked.len()
+    brain.total_interactions += (videos.len() as i32).min(ONBOARDING_WARMUP_INTERACTIONS);
+    brain.has_completed_onboarding = true;
+    videos.len()
 }
 
 pub fn apply_interaction(
@@ -814,31 +930,33 @@ pub fn apply_interaction(
 mod history_bootstrap_tests {
     use super::*;
 
-    fn video(id: &str, channel: &str) -> HistoryVideo {
+    fn video(id: &str, channel: &str, title: &str) -> HistoryVideo {
         HistoryVideo {
             video_id: id.to_string(),
-            title: format!("Worship night live session {id}"),
+            title: title.to_string(),
             channel_name: channel.to_string(),
             channel_id: format!("UC{channel}"),
             duration_seconds: Some(600),
+            watched_at_ms: chrono::Utc::now().timestamp_millis() as u64,
         }
     }
 
     #[test]
-    fn caps_each_channel_and_never_learns_a_video_twice() {
+    fn learns_every_video_without_one_channel_taking_over() {
         let mut brain = UserBrain::default();
-        let mut videos: Vec<HistoryVideo> = (0..30).map(|i| video(&format!("a{i}"), "one")).collect();
-        videos.extend((0..5).map(|i| video(&format!("b{i}"), "two")));
-        videos.push(video("b0", "two"));
+        let mut videos: Vec<HistoryVideo> = (0..3000)
+            .map(|i| video(&format!("a{i}"), "worship", "Worship night live session"))
+            .collect();
+        videos.extend((0..300).map(|i| video(&format!("b{i}"), "tech", "Rust programming tutorial")));
+        videos.push(video("b0", "tech", "Rust programming tutorial"));
 
-        assert_eq!(bootstrap_from_watch_history(&mut brain, &videos), 25);
-        assert!(!brain.global_vector.topics.is_empty());
+        assert_eq!(bootstrap_from_watch_history(&mut brain, &videos), 3300);
         assert!(brain.has_completed_onboarding);
-        assert_eq!(brain.total_interactions, 25);
-        assert!(brain.channel_scores["UCone"] > 0.5);
-
-        // A second run only learns what the first one left out.
-        assert_eq!(bootstrap_from_watch_history(&mut brain, &videos), 10);
-        assert_eq!(bootstrap_from_watch_history(&mut brain, &videos), 0);
+        assert_eq!(brain.total_interactions, ONBOARDING_WARMUP_INTERACTIONS);
+        assert!(brain.channel_scores["UCworship"] >= brain.channel_scores["UCtech"]);
+        assert!(brain.channel_scores["UCtech"] > 0.5);
+        assert!(brain.watch_history_map.len() <= WATCH_HISTORY_MAX);
+        // Both interests survive: the old one-by-one update would have decayed the smaller one away.
+        assert!(brain.global_vector.topics.len() >= 2, "{:?}", brain.global_vector.topics);
     }
 }

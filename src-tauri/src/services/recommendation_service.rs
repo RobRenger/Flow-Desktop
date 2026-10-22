@@ -1698,17 +1698,29 @@ impl RecommendationService {
     }
 
     /// Learn from watch history that reached this device without being watched here (a sync or
-    /// a Takeout import). Returns how many videos the brain learned from.
+    /// a Takeout import): the first run takes all of it, later runs only rows added since.
+    /// Returns how many videos the brain learned from.
     pub async fn learn_from_watch_history(&self) -> AppResult<usize> {
-        let rows = crate::db::watch_history::recent_videos_for_learning(&self.pool, 5000).await?;
+        const LEARNED_UP_TO: &str = "neuro_history_learned_id";
+        let after_id = crate::db::settings::get_setting(&self.pool, LEARNED_UP_TO)
+            .await?
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(0);
+        let rows = crate::db::watch_history::videos_for_learning(&self.pool, after_id).await?;
+        let Some(max_id) = rows.iter().map(|r| r.0).max() else {
+            return Ok(0);
+        };
         let videos: Vec<HistoryVideo> = rows
             .into_iter()
-            .map(|(video_id, title, channel_name, channel_id, duration)| HistoryVideo {
+            .map(|(_, video_id, title, channel_name, channel_id, duration, watch_date)| HistoryVideo {
                 video_id,
                 title,
                 channel_name: channel_name.unwrap_or_default(),
                 channel_id: channel_id.unwrap_or_default(),
                 duration_seconds: duration.filter(|d| *d > 0).map(|d| d as u64),
+                watched_at_ms: chrono::DateTime::parse_from_rfc3339(&watch_date)
+                    .map(|d| d.timestamp_millis().max(0) as u64)
+                    .unwrap_or(0),
             })
             .collect();
         let learned = {
@@ -1716,6 +1728,7 @@ impl RecommendationService {
             bootstrap_from_watch_history(&mut brain, &videos)
         };
         self.flush_brain().await?;
+        crate::db::settings::set_setting(&self.pool, LEARNED_UP_TO, &max_id.to_string()).await?;
         info!(learned, "[FlowNeuro] learned from watch history");
         Ok(learned)
     }

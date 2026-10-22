@@ -152,18 +152,22 @@ pub async fn get_watch_history(
     Ok(records)
 }
 
-/// The latest watched videos FlowNeuro can learn from: no songs, no Shorts, and no rows whose
-/// title is still a bare link (a Takeout entry for a video that no longer exists). Newest first.
-pub async fn recent_videos_for_learning(
+/// Watched videos FlowNeuro can learn from, oldest first, from rows after `after_id`: no songs,
+/// no Shorts, and no rows whose title is still a bare link (a Takeout entry for a video that no
+/// longer exists). Each row is (id, video_id, title, channel_name, channel_id, total_duration,
+/// watch_date).
+#[allow(clippy::type_complexity)]
+pub async fn videos_for_learning(
     pool: &SqlitePool,
-    limit: i64,
-) -> AppResult<Vec<(String, String, Option<String>, Option<String>, Option<i64>)>> {
+    after_id: i64,
+) -> AppResult<Vec<(i64, String, String, Option<String>, Option<String>, Option<i64>, String)>> {
     sqlx::query_as(
-        "SELECT video_id, title, channel_name, channel_id, total_duration_seconds FROM watch_history
-         WHERE is_music = 0 AND is_short = 0 AND title != '' AND title NOT LIKE 'http%'
-         ORDER BY watch_date DESC, created_at DESC LIMIT ?",
+        "SELECT id, video_id, title, channel_name, channel_id, total_duration_seconds, watch_date
+         FROM watch_history
+         WHERE id > ? AND is_music = 0 AND is_short = 0 AND title != '' AND title NOT LIKE 'http%'
+         ORDER BY watch_date ASC, created_at ASC",
     )
-    .bind(limit)
+    .bind(after_id)
     .fetch_all(pool)
     .await
     .map_err(AppError::from)
