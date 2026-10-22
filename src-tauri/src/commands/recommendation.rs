@@ -30,6 +30,16 @@ pub async fn rank_videos(
 }
 
 #[tauri::command]
+pub async fn learn_from_watch_history(
+    recommendation_service: State<'_, RecommendationService>,
+) -> Result<usize, ErrorResponse> {
+    recommendation_service
+        .learn_from_watch_history()
+        .await
+        .map_err(ErrorResponse::from)
+}
+
+#[tauri::command]
 pub async fn log_interaction(
     video_id: String,
     title: String,

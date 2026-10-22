@@ -25,7 +25,9 @@ use crate::flow_neuro::scoring::{
     channel_inferred_blocked, classify_persona, get_topic_categories, is_music_track,
     strip_domain_tag,
 };
-use crate::flow_neuro::signals::{InteractionType, apply_interaction};
+use crate::flow_neuro::signals::{
+    HistoryVideo, InteractionType, apply_interaction, bootstrap_from_watch_history,
+};
 use crate::models::video::{MusicHomeChip, MusicHomeSection, VideoSummary};
 use crate::services::youtube_service::YoutubeService;
 
@@ -1693,6 +1695,29 @@ impl RecommendationService {
         }
 
         Ok(())
+    }
+
+    /// Learn from watch history that reached this device without being watched here (a sync or
+    /// a Takeout import). Returns how many videos the brain learned from.
+    pub async fn learn_from_watch_history(&self) -> AppResult<usize> {
+        let rows = crate::db::watch_history::recent_videos_for_learning(&self.pool, 5000).await?;
+        let videos: Vec<HistoryVideo> = rows
+            .into_iter()
+            .map(|(video_id, title, channel_name, channel_id, duration)| HistoryVideo {
+                video_id,
+                title,
+                channel_name: channel_name.unwrap_or_default(),
+                channel_id: channel_id.unwrap_or_default(),
+                duration_seconds: duration.filter(|d| *d > 0).map(|d| d as u64),
+            })
+            .collect();
+        let learned = {
+            let mut brain = self.brain_store.write().await;
+            bootstrap_from_watch_history(&mut brain, &videos)
+        };
+        self.flush_brain().await?;
+        info!(learned, "[FlowNeuro] learned from watch history");
+        Ok(learned)
     }
 
     pub async fn record_feed_impressions(&self, videos: Vec<VideoSummary>) -> AppResult<()> {

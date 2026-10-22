@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Upload, Download, Trash2, FileText } from 'lucide-react';
+import { Upload, Download, Trash2, FileText, Brain } from 'lucide-react';
 import { SettingsGroup } from '../SettingsGroup';
 import { SettingItem } from '../SettingItem';
 import { Select } from '../../ui/Select';
@@ -15,6 +15,7 @@ import { getString } from '../../../lib/i18n/index';
 import { SETTINGS } from '../../../lib/settings/schema';
 import { isSettingDisabledUntilWired } from '../../../lib/settings/values';
 import { useUiStore } from '../../../store/useUiStore';
+import { learnFromWatchHistory } from '../../../lib/api/recommendation';
 
 export function DataTab() {
   const navigate = useNavigate();
@@ -24,6 +25,20 @@ export function DataTab() {
   const [historyCount, setHistoryCount] = useState(0);
   const [subCount, setSubCount] = useState(0);
   const [clearing, setClearing] = useState(false);
+  const [learning, setLearning] = useState(false);
+
+  const learnHistory = async () => {
+    setLearning(true);
+    try {
+      const learned = await learnFromWatchHistory();
+      showToast({ variant: 'success', message: getString('settings_learn_history_done', learned) });
+    } catch (error) {
+      console.error('Learning from watch history failed', error);
+      showToast({ variant: 'error', message: getString('settings_learn_history_failed') });
+    } finally {
+      setLearning(false);
+    }
+  };
 
   useEffect(() => {
     const load = async () => {
@@ -115,6 +130,14 @@ export function DataTab() {
               <div className="text-xs text-chrome-neutral-400 mt-0.5">{getString('settings_import_restore_desc')}</div>
             </div>
             <Button variant="secondary" size="sm" onClick={() => navigate('/settings/import')}><Upload size={14} />{getString('settings_import')}</Button>
+          </div>
+          <div className="border-t border-chrome-neutral-800/50" />
+          <div className="flex items-center justify-between px-5 py-4 hover:bg-surface-container transition-colors duration-200 ease-out">
+            <div className="flex-1 min-w-0 mr-4">
+              <div className="text-sm font-medium text-chrome-neutral-200">{getString('settings_learn_history')}</div>
+              <div className="text-xs text-chrome-neutral-400 mt-0.5">{getString('settings_learn_history_desc')}</div>
+            </div>
+            <Button variant="secondary" size="sm" disabled={learning} onClick={() => void learnHistory()}><Brain size={14} />{getString('settings_learn_history_action')}</Button>
           </div>
           <div className="border-t border-chrome-neutral-800/50" />
           <div className="flex items-center justify-between px-5 py-4 hover:bg-surface-container transition-colors duration-200 ease-out">

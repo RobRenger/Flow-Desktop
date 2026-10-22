@@ -152,6 +152,23 @@ pub async fn get_watch_history(
     Ok(records)
 }
 
+/// The latest watched videos FlowNeuro can learn from: no songs, no Shorts, and no rows whose
+/// title is still a bare link (a Takeout entry for a video that no longer exists). Newest first.
+pub async fn recent_videos_for_learning(
+    pool: &SqlitePool,
+    limit: i64,
+) -> AppResult<Vec<(String, String, Option<String>, Option<String>, Option<i64>)>> {
+    sqlx::query_as(
+        "SELECT video_id, title, channel_name, channel_id, total_duration_seconds FROM watch_history
+         WHERE is_music = 0 AND is_short = 0 AND title != '' AND title NOT LIKE 'http%'
+         ORDER BY watch_date DESC, created_at DESC LIMIT ?",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(AppError::from)
+}
+
 /// Titles of the latest videos watched, songs left out, newest first.
 pub async fn recent_video_titles(pool: &SqlitePool, limit: i64) -> AppResult<Vec<String>> {
     sqlx::query_scalar::<_, String>(

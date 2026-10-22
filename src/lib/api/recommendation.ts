@@ -517,3 +517,9 @@ export async function resetBrain(): Promise<void> {
   await invokeBackend<void>("reset_brain");
   brainCache = null;
 }
+
+/** Teaches FlowNeuro from synced or imported watch history. Resolves to how many videos it learned from. */
+export async function learnFromWatchHistory(): Promise<number> {
+  if (!(await isTauriEnv())) return 0;
+  return invokeBackend<number>("learn_from_watch_history");
+}

@@ -80,7 +80,7 @@ use commands::pip::{
 use commands::recommendation::{
     add_blocked_topic, add_preferred_topic, block_channel, complete_onboarding,
     generate_discovery_queries, get_brain_snapshot, get_feed_quotas, get_flow_persona,
-    get_onboarding_status, get_recommendation_events, log_interaction, mark_not_interested,
+    get_onboarding_status, get_recommendation_events, learn_from_watch_history, log_interaction, mark_not_interested,
     rank_videos, record_feed_impressions, remove_preferred_topic, reset_brain, unblock_channel,
     unblock_topic,
 };
@@ -476,6 +476,7 @@ pub fn run() {
             list_download_collections,
             delete_download_collections,
             rank_videos,
+            learn_from_watch_history,
             log_interaction,
             mark_not_interested,
             record_feed_impressions,

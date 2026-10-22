@@ -21,6 +21,7 @@ use crate::flow_neuro::scoring::{
     TOPIC_EVIDENCE_MAX_ENTRIES, TOPIC_EVIDENCE_MAX_IDS, TimeBucket, TopicEvidence, UserBrain,
     VIDEO_SUPPRESSION_DAYS, WATCH_HISTORY_MAX, WATCHED_THRESHOLD_FULL, WATCHED_THRESHOLD_SAMPLED,
     adjust_vector, apply_anchor_decay, classify_persona, extract_rejection_keys, strip_domain_tag,
+    ONBOARDING_WARMUP_INTERACTIONS,
 };
 
 pub const SHORTS_LEARNING_PENALTY: f64 = 0.40;
@@ -285,6 +286,121 @@ fn record_negative_topic_evidence(
 
 /// Applies one interaction to the in-memory brain (pure mutation, no I/O); persistence and
 /// event logging are handled by the caller against the resident `BrainStore`.
+/// A watched video from the history, for [`bootstrap_from_watch_history`].
+pub struct HistoryVideo {
+    pub video_id: String,
+    pub title: String,
+    pub channel_name: String,
+    pub channel_id: String,
+    pub duration_seconds: Option<u64>,
+}
+
+const HISTORY_BOOTSTRAP_MAX: usize = 500;
+const HISTORY_BOOTSTRAP_PER_CHANNEL: usize = 20;
+
+/// Teach the brain from watch history it never saw being watched (a sync or a Takeout import),
+/// the way Android's `FlowNeuroEngine.bootstrapFromWatchHistory` does: the newest
+/// [`HISTORY_BOOTSTRAP_MAX`] videos, at most [`HISTORY_BOOTSTRAP_PER_CHANNEL`] per channel, at a
+/// low rate that fades with age, so one binge or one channel can't take over the profile.
+/// `videos` is newest first. Videos the brain already counted are skipped, so running it again
+/// only learns what is new. Returns how many videos it learned from.
+pub fn bootstrap_from_watch_history(brain: &mut UserBrain, videos: &[HistoryVideo]) -> usize {
+    let mature = brain.total_interactions > 50 && brain.global_vector.topics.len() > 10;
+    let history_rate = if mature { 0.015 } else { 0.035 };
+    let idf_snapshot = IdfSnapshot {
+        word_frequencies: brain.idf_word_frequency.clone(),
+        total_documents: brain.idf_total_documents,
+    };
+    let spec = brain.key_spec();
+
+    let mut seen = HashSet::new();
+    let mut per_channel: HashMap<&str, usize> = HashMap::new();
+    let picked: Vec<&HistoryVideo> = videos
+        .iter()
+        .filter(|v| !v.video_id.is_empty() && !v.title.is_empty())
+        .filter(|v| !brain.counted_documents.contains(&v.video_id))
+        .filter(|v| seen.insert(v.video_id.as_str()))
+        .filter(|v| {
+            let key = if v.channel_id.is_empty() { v.channel_name.as_str() } else { v.channel_id.as_str() };
+            if key.is_empty() {
+                return true;
+            }
+            let count = per_channel.entry(key).or_insert(0);
+            *count += 1;
+            *count <= HISTORY_BOOTSTRAP_PER_CHANNEL
+        })
+        .take(HISTORY_BOOTSTRAP_MAX)
+        .collect();
+
+    for (index, video) in picked.iter().enumerate() {
+        let vector = extract_features(
+            &VideoText {
+                title: &video.title,
+                channel_name: &video.channel_name,
+                description: None,
+                duration_seconds: video.duration_seconds,
+                is_live: false,
+                is_short: false,
+            },
+            &TopicReader {
+                spec: spec.clone(),
+                idf: &idf_snapshot,
+            },
+        );
+        let decay = (1.0 - index as f64 / HISTORY_BOOTSTRAP_MAX as f64 * 0.4).clamp(0.6, 1.0);
+        brain.global_vector = adjust_vector(&brain.global_vector, &vector, history_rate * decay);
+
+        if !video.channel_id.is_empty() {
+            let current = *brain.channel_scores.get(&video.channel_id).unwrap_or(&0.5);
+            brain.channel_scores.insert(
+                video.channel_id.clone(),
+                current * CHANNEL_EMA_DECAY + CHANNEL_EMA_ALPHA,
+            );
+        }
+
+        let mut top: Vec<(&String, &f64)> = vector.topics.iter().collect();
+        top.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let top: Vec<&String> = top.into_iter().take(3).map(|(k, _)| k).collect();
+        for i in 0..top.len() {
+            for j in i + 1..top.len() {
+                let key = make_affinity_key(top[i], top[j]);
+                let current = *brain.topic_affinities.get(&key).unwrap_or(&0.0);
+                brain.topic_affinities.insert(key, (current + 0.01).min(AFFINITY_MAX));
+            }
+        }
+
+        brain.topic_evidence = update_topic_evidence(
+            &brain.topic_evidence,
+            &vector,
+            &video.video_id,
+            &video.channel_id,
+            0.25,
+            false,
+            false,
+        );
+
+        if brain.counted_documents.insert(video.video_id.clone()) {
+            for term in document_terms(&video.title, &vector, &spec) {
+                *brain.idf_word_frequency.entry(term).or_insert(0) += 1;
+            }
+            brain.idf_total_documents += 1;
+        }
+        brain.watch_history_map.entry(video.video_id.clone()).or_insert(0.5);
+    }
+
+    if brain.idf_word_frequency.len() > IDF_MAX_KEYS {
+        let mut entries: Vec<(String, i32)> = brain.idf_word_frequency.drain().collect();
+        entries.sort_by(|a, b| b.1.cmp(&a.1));
+        entries.truncate(IDF_KEEP_KEYS);
+        brain.idf_word_frequency = entries.into_iter().collect();
+    }
+    if !picked.is_empty() {
+        brain.total_interactions += (picked.len() as i32).min(ONBOARDING_WARMUP_INTERACTIONS);
+        brain.has_completed_onboarding = true;
+    }
+    picked.len()
+}
+
 pub fn apply_interaction(
     brain: &mut UserBrain,
     video_id: &str,
@@ -691,5 +807,38 @@ pub fn apply_interaction(
     InteractionOutcome {
         learning_rate: Some(learning_rate),
         primary_topic,
+    }
+}
+
+#[cfg(test)]
+mod history_bootstrap_tests {
+    use super::*;
+
+    fn video(id: &str, channel: &str) -> HistoryVideo {
+        HistoryVideo {
+            video_id: id.to_string(),
+            title: format!("Worship night live session {id}"),
+            channel_name: channel.to_string(),
+            channel_id: format!("UC{channel}"),
+            duration_seconds: Some(600),
+        }
+    }
+
+    #[test]
+    fn caps_each_channel_and_never_learns_a_video_twice() {
+        let mut brain = UserBrain::default();
+        let mut videos: Vec<HistoryVideo> = (0..30).map(|i| video(&format!("a{i}"), "one")).collect();
+        videos.extend((0..5).map(|i| video(&format!("b{i}"), "two")));
+        videos.push(video("b0", "two"));
+
+        assert_eq!(bootstrap_from_watch_history(&mut brain, &videos), 25);
+        assert!(!brain.global_vector.topics.is_empty());
+        assert!(brain.has_completed_onboarding);
+        assert_eq!(brain.total_interactions, 25);
+        assert!(brain.channel_scores["UCone"] > 0.5);
+
+        // A second run only learns what the first one left out.
+        assert_eq!(bootstrap_from_watch_history(&mut brain, &videos), 10);
+        assert_eq!(bootstrap_from_watch_history(&mut brain, &videos), 0);
     }
 }
