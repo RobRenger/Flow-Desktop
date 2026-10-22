@@ -232,6 +232,20 @@ export const FlowPlayerControls: React.FC<FlowPlayerControlsProps> = ({
     return capped;
   }, [chapters, duration, isLive]);
 
+  // Each segment's share of the track, as laid out by its flexGrow. The fills are drawn in these
+  // fractions, the same scale as the playhead, so a chapter list that doesn't add up to the media
+  // duration can't pull the bar away from the playhead.
+  const segmentSpans = React.useMemo(() => {
+    const grows = segments.map((segment) => Math.max(0.1, segment.endSeconds - segment.startSeconds));
+    const total = grows.reduce((sum, grow) => sum + grow, 0);
+    let from = 0;
+    return grows.map((grow) => {
+      const span = { from: from / total, to: (from + grow) / total };
+      from += grow;
+      return span;
+    });
+  }, [segments]);
+
   const bufferedPctRef = useRef(bufferedPct);
   useLayoutEffect(() => {
     bufferedPctRef.current = bufferedPct;
@@ -242,14 +256,20 @@ export const FlowPlayerControls: React.FC<FlowPlayerControlsProps> = ({
     const container = containerRef.current;
     if (!container) return;
     // `segments` is a dependency, so these fills are current for this run.
-    const progressFills = [...container.querySelectorAll<HTMLElement>(".chapter-progress-fill")];
-    const bufferedFills = [...container.querySelectorAll<HTMLElement>(".chapter-buffered-fill")];
+    let progressFills = [...container.querySelectorAll<HTMLElement>(".chapter-progress-fill")];
+    let bufferedFills = [...container.querySelectorAll<HTMLElement>(".chapter-buffered-fill")];
     const chapterTitle = chapterPillRef.current?.querySelector<HTMLElement>(".chapter-title");
     let video = container.querySelector("video");
 
     const updateProgress = () => {
       if (!video?.isConnected) video = container.querySelector("video");
       if (!video) return;
+      // A re-render can swap the fill elements without changing `segments`. Writing to the old,
+      // detached ones would leave the visible bar behind while the playhead keeps moving.
+      if (progressFills.some((fill) => !fill.isConnected)) {
+        progressFills = [...container.querySelectorAll<HTMLElement>(".chapter-progress-fill")];
+        bufferedFills = [...container.querySelectorAll<HTMLElement>(".chapter-buffered-fill")];
+      }
       const cur = video.currentTime;
 
       // Live: the seekbar tracks the DVR window and the time shows real broadcast elapsed.
@@ -267,20 +287,21 @@ export const FlowPlayerControls: React.FC<FlowPlayerControlsProps> = ({
       }
 
       const dur = video.duration || duration || 0;
-      const pct = `${dur > 0 ? Math.min(100, Math.max(0, (cur / dur) * 100)) : 0}%`;
+      const played = dur > 0 ? Math.min(1, Math.max(0, cur / dur)) : 0;
+      const pct = `${played * 100}%`;
       setStyleIfChanged(progressBarRef.current, "width", pct);
       setStyleIfChanged(playheadRef.current, "left", pct);
 
       for (const fill of progressFills) {
-        const start = parseFloat(fill.dataset.start || "0");
-        const end = parseFloat(fill.dataset.end || "0");
-        setStyleIfChanged(fill, "width", `${segmentFillPercent(cur, start, end)}%`);
+        const from = parseFloat(fill.dataset.from || "0");
+        const to = parseFloat(fill.dataset.to || "0");
+        setStyleIfChanged(fill, "width", `${segmentFillPercent(played, from, to)}%`);
       }
-      const bufferedTime = (bufferedPctRef.current / 100) * dur;
+      const buffered = Math.min(1, Math.max(0, bufferedPctRef.current / 100));
       for (const fill of bufferedFills) {
-        const start = parseFloat(fill.dataset.start || "0");
-        const end = parseFloat(fill.dataset.end || "0");
-        setStyleIfChanged(fill, "width", `${segmentFillPercent(bufferedTime, start, end)}%`);
+        const from = parseFloat(fill.dataset.from || "0");
+        const to = parseFloat(fill.dataset.to || "0");
+        setStyleIfChanged(fill, "width", `${segmentFillPercent(buffered, from, to)}%`);
       }
 
       setTextIfChanged(currentTimeRef.current, formatTime(cur));
@@ -312,7 +333,7 @@ export const FlowPlayerControls: React.FC<FlowPlayerControlsProps> = ({
       if (frame !== null) cancelAnimationFrame(frame);
       for (const event of PROGRESS_EVENTS) source?.removeEventListener(event, updateProgress);
     };
-  }, [animateProgress, containerRef, duration, segments, isLive]);
+  }, [animateProgress, containerRef, duration, segments, segmentSpans, isLive]);
 
   const progressPct =
     duration > 0
@@ -512,16 +533,16 @@ export const FlowPlayerControls: React.FC<FlowPlayerControlsProps> = ({
                       {/* Buffered Fill for this Segment */}
                       <div
                         className="chapter-buffered-fill absolute inset-y-0 left-0 rounded-full bg-chrome-white/40 pointer-events-none transition-[width] duration-150"
-                        data-start={segment.startSeconds}
-                        data-end={segment.endSeconds}
+                        data-from={segmentSpans[idx]?.from ?? 0}
+                        data-to={segmentSpans[idx]?.to ?? 1}
                         style={{ width: "0%" }}
                       />
 
                       {/* Playback Progress Fill for this Segment */}
                       <div
                         className="chapter-progress-fill absolute inset-y-0 left-0 rounded-full bg-primary pointer-events-none"
-                        data-start={segment.startSeconds}
-                        data-end={segment.endSeconds}
+                        data-from={segmentSpans[idx]?.from ?? 0}
+                        data-to={segmentSpans[idx]?.to ?? 1}
                         style={{ width: "0%" }}
                       />
 
