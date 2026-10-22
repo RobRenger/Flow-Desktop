@@ -458,7 +458,7 @@ export const SubtitleOverlay: React.FC<SubtitleOverlayProps> = ({
   const textStyle: React.CSSProperties = {
     fontSize: `max(${MIN_CAPTION_PX}px, var(--caption-size) * ${subtitleStyle.fontScale / 100})`,
     color: subtitleStyle.textColor,
-    fontWeight: subtitleStyle.isBold ? "700" : "500",
+    fontWeight: subtitleStyle.isBold ? "700" : "400",
   };
 
   const cueLines = (activeCue ? activeCue.text : getString("subtitles_track_unavailable")).split("\n");

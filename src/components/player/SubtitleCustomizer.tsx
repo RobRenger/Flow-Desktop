@@ -62,7 +62,7 @@ export const SubtitleCustomizer: React.FC = () => {
             color: subtitleStyle.textColor,
             // The real size follows the player; the preview only shows the relative size, kept inside its box.
             fontSize: `${Math.min(32, (16 * subtitleStyle.fontScale) / 100)}px`,
-            fontWeight: subtitleStyle.isBold ? "700" : "500",
+            fontWeight: subtitleStyle.isBold ? "700" : "400",
             lineHeight: "1.35",
             boxShadow: "0 10px 25px -5px color-mix(in srgb, var(--color-chrome-black) 50%, transparent)",
           }}

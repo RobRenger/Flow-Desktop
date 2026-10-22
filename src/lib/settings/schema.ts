@@ -252,7 +252,7 @@ export const SETTING_DEFINITIONS = [
   bool(SETTINGS.SUBTITLES_ENABLED, "player", false, "wired"),
   str(SETTINGS.PREFERRED_SUBTITLE_LANGUAGE, "player", "en", "wired"),
   str(SETTINGS.SUBTITLE_FONT_SCALE, "player", "100", "wired", ["50", "75", "100", "150", "200", "300", "400"]),
-  bool(SETTINGS.SUBTITLE_BOLD, "player", true, "wired"),
+  bool(SETTINGS.SUBTITLE_BOLD, "player", false, "wired"),
   bool(SETTINGS.MINI_PLAYER_SHOW_SKIP_CONTROLS, "player", true, "wired"),
   bool(SETTINGS.MINI_PLAYER_SHOW_NEXT_PREV_CONTROLS, "player", true, "wired"),
   bool(SETTINGS.SHOW_FULLSCREEN_TITLE, "player", false, "wired"),

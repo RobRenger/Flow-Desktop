@@ -44,7 +44,7 @@ export const DEFAULT_SUBTITLE_STYLE: SubtitleStyle = {
   textColor: "#FFFFFF",
   backgroundColor: "#000000",
   backgroundOpacity: 0.75,
-  isBold: true,
+  isBold: false,
   // YouTube's: its caption box sits 2% of the player's height above the bottom.
   bottomOffset: 2,
 };
