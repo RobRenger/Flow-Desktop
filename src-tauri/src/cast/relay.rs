@@ -3,20 +3,36 @@
 //! unguessable LAN path that forwards (with Range) to its loopback URL.
 
 use futures_util::StreamExt;
-use std::collections::hash_map::RandomState;
+use rand::rngs::SysRng;
+use rand::TryRng;
 use std::collections::HashMap;
-use std::hash::{BuildHasher, Hasher};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 
-const MAX_ROUTES: usize = 32;
+/// The speaker only ever fetches the current track; a few spare routes cover
+/// a load that is still in flight when the next one is registered.
+const MAX_ROUTES: usize = 4;
+const MAX_CONNECTIONS: usize = 16;
+const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
+const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Lives as long as one cast session: dropping it closes the listener and
+/// forgets every route, so no LAN path outlives the session that handed it out.
 pub struct Relay {
     base: String,
     routes: Arc<Mutex<Vec<(String, String)>>>,
-    salt: RandomState,
+    accept: tauri::async_runtime::JoinHandle<()>,
+}
+
+impl Drop for Relay {
+    fn drop(&mut self) {
+        self.accept.abort();
+        self.routes.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    }
 }
 
 impl Relay {
@@ -25,47 +41,45 @@ impl Relay {
         let listener = TcpListener::bind((ip, 0)).await.map_err(|e| e.to_string())?;
         let port = listener.local_addr().map_err(|e| e.to_string())?.port();
         let routes: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder().connect_timeout(UPSTREAM_TIMEOUT).build().map_err(|e| e.to_string())?;
         let accept_routes = routes.clone();
-        tauri::async_runtime::spawn(async move {
+        let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+        let accept = tauri::async_runtime::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
+                // Over the limit the connection is dropped, not queued.
+                let Ok(slot) = slots.clone().try_acquire_owned() else { continue };
                 let routes = accept_routes.clone();
                 let client = client.clone();
                 tauri::async_runtime::spawn(async move {
                     if let Err(e) = serve(stream, routes, client).await {
                         tracing::debug!("cast relay request ended: {e}");
                     }
+                    drop(slot);
                 });
             }
         });
-        Ok(Self { base: format!("http://{ip}:{port}"), routes, salt: RandomState::new() })
+        Ok(Self { base: format!("http://{ip}:{port}"), routes, accept })
     }
 
     /// The LAN URL a speaker can fetch `upstream` from.
-    pub fn register(&self, upstream: String) -> String {
-        let mut hasher = self.salt.build_hasher();
-        hasher.write(upstream.as_bytes());
-        hasher.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
-        let token = format!("{:016x}{:016x}", hasher.finish(), self.salt.hash_one(hasher.finish()));
+    pub fn register(&self, upstream: String) -> Result<String, String> {
+        let mut bytes = [0u8; 16];
+        SysRng.try_fill_bytes(&mut bytes).map_err(|e| format!("no OS randomness: {e}"))?;
+        let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
         let mut routes = self.routes.lock().unwrap_or_else(|p| p.into_inner());
         if routes.len() >= MAX_ROUTES {
             routes.remove(0);
         }
         routes.push((token.clone(), upstream));
-        format!("{}/cast/{token}", self.base)
+        Ok(format!("{}/cast/{token}", self.base))
     }
 }
 
 async fn serve(mut stream: TcpStream, routes: Arc<Mutex<Vec<(String, String)>>>, client: reqwest::Client) -> Result<(), String> {
-    let mut head = Vec::with_capacity(2048);
-    let mut buf = [0u8; 2048];
-    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
-        let n = stream.read(&mut buf).await.map_err(|e| e.to_string())?;
-        if n == 0 || head.len() > 16 * 1024 {
-            return Ok(());
-        }
-        head.extend_from_slice(&buf[..n]);
-    }
+    let Ok(head) = tokio::time::timeout(HEAD_TIMEOUT, read_head(&mut stream)).await else {
+        return Err("request head timed out".into());
+    };
+    let Some(head) = head? else { return Ok(()) };
     let text = String::from_utf8_lossy(&head);
     let mut lines = text.split("\r\n");
     let mut first = lines.next().unwrap_or_default().split_whitespace();
@@ -91,7 +105,10 @@ async fn serve(mut stream: TcpStream, routes: Arc<Mutex<Vec<(String, String)>>>,
     if let Some(range) = headers.get("range") {
         request = request.header("Range", range);
     }
-    let response = request.send().await.map_err(|e| e.to_string())?;
+    let response = tokio::time::timeout(UPSTREAM_TIMEOUT, request.send())
+        .await
+        .map_err(|_| "upstream timed out".to_string())?
+        .map_err(|e| e.to_string())?;
     let mut out = format!("HTTP/1.1 {}\r\n{cors}Accept-Ranges: bytes\r\nConnection: close\r\n", response.status());
     for name in ["content-type", "content-length", "content-range"] {
         if let Some(value) = response.headers().get(name).and_then(|v| v.to_str().ok()) {
@@ -108,4 +125,18 @@ async fn serve(mut stream: TcpStream, routes: Arc<Mutex<Vec<(String, String)>>>,
         stream.write_all(&chunk.map_err(|e| e.to_string())?).await.map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// The request line and headers, or `None` when the client gave up or sent too much.
+async fn read_head(stream: &mut TcpStream) -> Result<Option<Vec<u8>>, String> {
+    let mut head = Vec::with_capacity(2048);
+    let mut buf = [0u8; 2048];
+    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+        let n = stream.read(&mut buf).await.map_err(|e| e.to_string())?;
+        if n == 0 || head.len() > 16 * 1024 {
+            return Ok(None);
+        }
+        head.extend_from_slice(&buf[..n]);
+    }
+    Ok(Some(head))
 }

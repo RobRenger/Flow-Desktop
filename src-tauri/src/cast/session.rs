@@ -26,6 +26,12 @@ const NS_HEARTBEAT: &str = "urn:x-cast:com.google.cast.tp.heartbeat";
 const NS_RECEIVER: &str = "urn:x-cast:com.google.cast.receiver";
 const NS_MEDIA: &str = "urn:x-cast:com.google.cast.media";
 const MAX_FRAME: u32 = 64 * 1024;
+/// TCP plus TLS handshake; a speaker that accepts but never answers must not
+/// leave the connect hanging.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+/// Receivers answer every PING and send their own; this long without any
+/// frame means the speaker is gone (power, Wi-Fi), not merely idle.
+const SILENCE_LIMIT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -52,6 +58,7 @@ pub enum Command {
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct MediaStatus {
+    session: u64,
     player_state: String,
     idle_reason: Option<String>,
     current_time: f64,
@@ -68,26 +75,29 @@ impl CastSession {
         self.commands.send(command).map_err(|_| "Cast session closed".to_string())
     }
 
-    pub async fn connect(device: CastDevice, app: AppHandle) -> Result<Self, String> {
-        let tcp = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect((device.host.as_str(), device.port)))
+    /// `session` tags every event this connection emits.
+    pub async fn connect(device: CastDevice, app: AppHandle, session: u64) -> Result<Self, String> {
+        let tls = tokio::time::timeout(CONNECT_TIMEOUT, open_tls(&device))
             .await
-            .map_err(|_| "Timed out connecting to speaker".to_string())?
-            .map_err(|e| e.to_string())?;
-        let provider = Arc::new(aws_lc_rs::default_provider());
-        let config = ClientConfig::builder_with_provider(provider.clone())
-            .with_safe_default_protocol_versions()
-            .map_err(|e| e.to_string())?
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AcceptAnyCert(provider)))
-            .with_no_client_auth();
-        let name = ServerName::try_from(device.host.clone()).map_err(|e| e.to_string())?;
-        let tls = TlsConnector::from(Arc::new(config)).connect(name, tcp).await.map_err(|e| e.to_string())?;
-
+            .map_err(|_| "Timed out connecting to speaker".to_string())??;
         let (tx, rx) = mpsc::unbounded_channel();
-        let actor = Actor { app, state: Default::default(), pending_load: None };
+        let actor = Actor { app, session, state: Default::default(), pending_load: None };
         tauri::async_runtime::spawn(actor.run(tls, rx));
         Ok(Self { commands: tx })
     }
+}
+
+async fn open_tls(device: &CastDevice) -> Result<tokio_rustls::client::TlsStream<TcpStream>, String> {
+    let tcp = TcpStream::connect((device.host.as_str(), device.port)).await.map_err(|e| e.to_string())?;
+    let provider = Arc::new(aws_lc_rs::default_provider());
+    let config = ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| e.to_string())?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyCert(provider)))
+        .with_no_client_auth();
+    let name = ServerName::try_from(device.host.clone()).map_err(|e| e.to_string())?;
+    TlsConnector::from(Arc::new(config)).connect(name, tcp).await.map_err(|e| e.to_string())
 }
 
 #[derive(Default)]
@@ -95,11 +105,17 @@ struct State {
     transport_id: Option<String>,
     app_session_id: Option<String>,
     media_session_id: Option<i64>,
+    /// Highest media session seen, and the highest that belonged to an earlier
+    /// track: statuses at or below the floor are late news about that track.
+    last_media_id: i64,
+    stale_floor: i64,
+    load_request: Option<i64>,
     next_request: i64,
 }
 
 struct Actor {
     app: AppHandle,
+    session: u64,
     state: State,
     pending_load: Option<LoadRequest>,
 }
@@ -153,11 +169,18 @@ impl Actor {
         });
 
         let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
+        let mut last_heard = tokio::time::Instant::now();
         let error: Option<String> = loop {
             tokio::select! {
-                _ = heartbeat.tick() => send(NS_HEARTBEAT, RECEIVER, json!({ "type": "PING" })),
+                _ = heartbeat.tick() => {
+                    if last_heard.elapsed() > SILENCE_LIMIT {
+                        break Some("speaker stopped responding".into());
+                    }
+                    send(NS_HEARTBEAT, RECEIVER, json!({ "type": "PING" }));
+                }
                 frame = frames.recv() => match frame {
                     Some(Ok(message)) => {
+                        last_heard = tokio::time::Instant::now();
                         match self.handle(&message, &send) {
                             Ok(true) => {}
                             Ok(false) => break None,
@@ -185,7 +208,7 @@ impl Actor {
         if let Some(e) = &error {
             tracing::warn!("cast session ended: {e}");
         }
-        let _ = self.app.emit("cast://closed", json!({ "error": error }));
+        let _ = self.app.emit("cast://closed", json!({ "session": self.session, "error": error }));
     }
 
     fn request(&mut self, kind: &str) -> Value {
@@ -203,6 +226,7 @@ impl Actor {
         match command {
             Command::Load(load) => {
                 self.state.media_session_id = None;
+                self.state.stale_floor = self.state.last_media_id;
                 let mut metadata = json!({ "metadataType": 3 });
                 for (key, value) in [("title", &load.title), ("artist", &load.artist), ("albumName", &load.album)] {
                     if let Some(v) = value {
@@ -213,6 +237,7 @@ impl Actor {
                     metadata["images"] = json!([{ "url": art }]);
                 }
                 let request = self.request("LOAD");
+                self.state.load_request = request["requestId"].as_i64();
                 send(NS_MEDIA, &transport, merge(request, json!({
                     "sessionId": self.state.app_session_id,
                     "media": {
@@ -251,26 +276,33 @@ impl Actor {
             "RECEIVER_STATUS" => return Ok(self.receiver_status(&payload["status"], send)),
             "MEDIA_STATUS" => {
                 let Some(status) = payload["status"].get(0) else { return Ok(true) };
-                if let Some(id) = status["mediaSessionId"].as_i64() {
-                    self.state.media_session_id = Some(id);
-                }
+                let Some(id) = status["mediaSessionId"].as_i64().filter(|&id| id > self.state.stale_floor) else { return Ok(true) };
+                self.state.last_media_id = self.state.last_media_id.max(id);
+                self.state.media_session_id = Some(id);
                 let _ = self.app.emit("cast://status", MediaStatus {
+                    session: self.session,
                     player_state: status["playerState"].as_str().unwrap_or_default().to_string(),
                     idle_reason: status["idleReason"].as_str().map(str::to_string),
                     current_time: status["currentTime"].as_f64().unwrap_or(0.0),
                     duration: status["media"]["duration"].as_f64(),
-                    media_session_id: self.state.media_session_id.unwrap_or(0),
+                    media_session_id: id,
                 });
             }
-            "LOAD_FAILED" | "LOAD_CANCELLED" | "INVALID_REQUEST" => {
+            // Only a refused LOAD of the current track counts as a failed track:
+            // a rejected PAUSE, SEEK or SET_VOLUME, or LOAD_CANCELLED for a load
+            // the next one replaced, says nothing about what is playing now.
+            "LOAD_FAILED" | "INVALID_REQUEST" if payload["requestId"].as_i64().is_some() && payload["requestId"].as_i64() == self.state.load_request => {
+                self.state.load_request = None;
                 let _ = self.app.emit("cast://status", MediaStatus {
+                    session: self.session,
                     player_state: "IDLE".into(),
                     idle_reason: Some("ERROR".into()),
                     current_time: 0.0,
                     duration: None,
-                    media_session_id: self.state.media_session_id.unwrap_or(0),
+                    media_session_id: 0,
                 });
             }
+            "INVALID_REQUEST" => tracing::debug!("cast receiver rejected a request: {payload}"),
             "LAUNCH_ERROR" => return Err(format!("receiver refused to launch: {payload}")),
             _ => {}
         }
@@ -281,6 +313,7 @@ impl Actor {
     fn receiver_status(&mut self, status: &Value, send: &impl Fn(&str, &str, Value)) -> bool {
         if let Some(volume) = status.get("volume") {
             let _ = self.app.emit("cast://volume", json!({
+                "session": self.session,
                 "level": volume["level"].as_f64().unwrap_or(1.0),
                 "muted": volume["muted"].as_bool().unwrap_or(false),
             }));
@@ -295,7 +328,7 @@ impl Actor {
         send(NS_CONNECTION, &transport, json!({ "type": "CONNECT" }));
         self.state.transport_id = Some(transport);
         self.state.app_session_id = Some(session);
-        let _ = self.app.emit("cast://ready", json!({}));
+        let _ = self.app.emit("cast://ready", json!({ "session": self.session }));
         if let Some(load) = self.pending_load.take() {
             self.command(Command::Load(load), send);
         }

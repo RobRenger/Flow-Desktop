@@ -104,8 +104,10 @@ class CastRemote implements RemoteOutput {
   }
 
   onStatus(status: CastMediaStatus): void {
-    if (this.staleSessionId !== null && status.mediaSessionId === this.staleSessionId) return;
-    if (status.mediaSessionId) this.sessionId = status.mediaSessionId;
+    // Media session ids only grow; id 0 is the backend reporting a refused load.
+    const loadRefused = status.mediaSessionId === 0;
+    if (!loadRefused && this.staleSessionId !== null && status.mediaSessionId <= this.staleSessionId) return;
+    if (status.mediaSessionId > this.sessionId) this.sessionId = status.mediaSessionId;
     const player = useMusicPlayerStore.getState();
     switch (status.playerState) {
       case "PLAYING":
@@ -160,6 +162,8 @@ class CastRemote implements RemoteOutput {
 
 let remote: CastRemote | null = null;
 let unlisten: UnlistenFn[] = [];
+/** Tags each connection; starts from the clock so a reloaded window never reuses one. */
+let lastSession = Date.now();
 
 /** Reloads the current track on whichever output the engine now uses. */
 async function resumeCurrentTrack(play: boolean): Promise<void> {
@@ -201,7 +205,9 @@ export const useCastStore = create<CastStore>((set, get) => ({
     if (remote) await get().stop();
     set({ phase: "connecting", device });
     const castRemote = new CastRemote();
-    unlisten = await listenToCast({
+    const session = ++lastSession;
+    remote = castRemote;
+    const listeners = await listenToCast(session, {
       onReady: () => {
         if (remote !== castRemote) return;
         set({ phase: "connected" });
@@ -212,16 +218,26 @@ export const useCastStore = create<CastStore>((set, get) => ({
       onStatus: (status) => {
         if (remote === castRemote) castRemote.onStatus(status);
       },
-      onClosed: () => {
+      onClosed: (error) => {
         if (remote !== castRemote) return;
+        console.warn("[cast] session ended", error);
         set({ phase: "failed" });
         void backToComputer();
+        // Lets the backend drop the session and close its LAN relay.
+        void disconnectCast(session).catch(() => undefined);
       },
     });
-    remote = castRemote;
+    if (remote !== castRemote) {
+      // Stopped or switched while the listeners were being set up.
+      listeners.forEach((u) => u());
+      return;
+    }
+    unlisten = listeners;
     try {
-      await connectCast(device);
+      await connectCast(device, session);
     } catch (e) {
+      // A cancelled connect belongs to a cast the user already left.
+      if (remote !== castRemote) return;
       console.error("[cast] connect failed", e);
       set({ phase: "failed" });
       await backToComputer();
